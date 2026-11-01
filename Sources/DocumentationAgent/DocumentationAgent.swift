@@ -68,7 +68,8 @@ public struct DocumentationAgent: GraniteAgentPackage {
         "rounds": "how many times the model's prose may be asked again after it fails a check; 3 when left out",
     ]
     public static let guide = """
-        Tag docs to document the project you are in, from its code. One call per kind of documentation, `make`:
+        Tag docs to document the project you are in, from its code. Call it before reading the code: it reads the \
+        project itself and names every file it wrote. One call per kind of documentation, `make`:
         - `readme` writes README.md: what the project is and its features (the model's prose, each claim citing a \
         file), the requirements, how to build and test it (read off its Xcode schemes, SwiftPM products and \
         package.json scripts), its folder tree with a line each, and how it is built (services, components, \
