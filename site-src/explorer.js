@@ -1,0 +1,1242 @@
+/* The documentation site — the Explorer: every file of code, verbatim, with its declarations; the trails, walks through
+   the code step by step; the Granite services by rank with their events; and a call graph read when the site was
+   written: the Granite flows between services and components, the calls through declared types and protocols, and the
+   rest matched by name and argument labels. Generalized from Craft's companion (Docs/site/explorer.js), itself ported
+   from Braid's code explorer. The data (explorer/*.js) loads the first time the view opens, so other pages never pay.
+   PIN: the view keeps its own elements. The find box, the source's scroll and the tree's open folders outlive every
+   hash change, and Arch.render redraws `main` on each one, so `after` re-attaches what `mount` built once. The
+   Explorer writes its own place into the address with replaceState, which fires no hashchange. */
+(() => {
+  'use strict';
+  const Arch = window.Arch;
+  if (!Arch.data) return;
+  const { h, html } = Arch;
+  const KIND = { f: 'func', i: 'init', d: 'deinit', s: 'subscript', v: 'var', S: 'struct', C: 'class', E: 'enum', A: 'actor', X: 'extension', P: 'protocol' };
+  const TAG = { f: 'func', i: 'init', d: 'deinit', s: 'subs', v: 'var', S: 'struct', C: 'class', E: 'enum', A: 'actor', X: 'ext', P: 'proto' };
+  const TIERS = ['exact', 'likely', 'ambiguous'];
+  // How one declaration reaches the next on a trail, and what a flow edge says: [before the source, after it].
+  const HOP = {
+    event: ['Sent as an event by ', ''], relay: ['Called through a relay by ', ''], own: ['Called on its own service by ', ''],
+    agent: ['Run as an @Agent by ', ''], frames: ['Reduces the frames ', ' yields, on main'], reply: ['Woken when ', ' answers its ticket'],
+    handler: ['A handler the root installed, fired by ', ''], call: ['Called by ', ''], caller: ['Calls ', ', the entry before'],
+    protocol: ['Called through a protocol by ', ''], none: ['Not reached by a call the matcher could read from ', ''],
+    sent: ['An event of its center, sent from elsewhere: what sends it is under Called by', ''],
+  };
+  const FLOW_WORD = { event: 'event', relay: 'relay', own: 'own service', agent: '@Agent run', frames: 'frames', reply: 'reply', handler: 'root handler', protocol: 'protocol' };
+  const REQUIREMENT = 1, OPERATOR = 2, LOCAL = 4;
+  const CALLABLE = 'fis';
+  const NARROW = 860;
+  const REBUILD = 'call the docs agent again with make: site';
+
+  const sources = () => (window.DOCS_EXPLORER || {}).sources || null;
+  const push = (map, key, value) => { (map[key] = map[key] || []).push(value); };
+
+  // MARK: - Loading, once
+
+  let loading = null;
+  /** Resolves true once explorer/index.js and every unit it names have run. A failure is not cached. */
+  function load() {
+    if (loading) return loading;
+    const add = (src) => new Promise((done) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = () => done(true);
+      s.onerror = () => { s.remove(); done(false); };
+      document.head.appendChild(s);
+    });
+    loading = add('explorer/index.js').then((ok) => {
+      const src = sources();
+      if (!ok || !src || !src.index) return false;
+      return Promise.all(src.index.modules.map((m) => (Arch.own(src, m) ? true : add('explorer/' + Arch.own(src.index.units, m) + '.js')))).then((all) => all.every(Boolean));
+    }).then((ok) => { if (!ok) loading = null; return ok; });
+    return loading;
+  }
+  /** Resolves true once the sources are loaded and the model is built: the orb calls it on any view before it asks. */
+  const ensure = () => load().then((ok) => ok && !!build());
+
+  // MARK: - The model, built once from the data
+
+  let model = null;
+  function build() {
+    if (model) return model;
+    const src = sources();
+    if (!src || !src.index) return null;
+    const index = src.index, files = [], scopes = [], byPath = Object.create(null), missing = [];
+    index.modules.forEach((mod) => {
+      const unit = Arch.own(src, mod);
+      if (!unit) { missing.push(mod); return; }
+      unit.files.forEach((f) => {
+        const file = { path: f.path, name: f.path.split('/').pop(), module: f.module || mod, unit: mod, lang: f.lang || 'Swift', text: f.text, header: f.header,
+                       summary: f.summary || '', marks: f.marks || [], first: f.first, lineCount: f.lines, bytes: f.bytes, scopes: [], lines: null };
+        (f.scopes || []).forEach((row, k) => {
+          const sc = { g: f.first + k, local: k, file, kind: row[0], name: row[1], labels: row[2], mods: row[3], decl: row[4], sig: row[5],
+                       brace: row[6], end: row[7], doc: row[8], parent: row[9], flags: row[10], cases: row[11] || null };
+          file.scopes.push(sc);
+          scopes[sc.g] = sc;
+        });
+        files.push(file);
+        byPath[file.path] = file;
+      });
+    });
+    // Keyed by names from the code, so no key may meet Object.prototype's: a Swift `constructor` is a name like any other.
+    const byQualified = Object.create(null), byName = Object.create(null), byLabelled = Object.create(null);
+    files.forEach((file) => {
+      const seen = Object.create(null);
+      file.scopes.forEach((sc) => {
+        const names = [];
+        for (let k = sc.local; k >= 0; k = file.scopes[k].parent) names.unshift(file.scopes[k].name);
+        sc.qualified = names.join('.');
+        sc.callable = CALLABLE.indexOf(sc.kind) >= 0;
+        sc.labelText = sc.callable ? '(' + sc.labels.map((l) => l + ':').join('') + ')' : '';
+        const tail = sc.kind === 'X' ? 'extension:' + sc.qualified : sc.qualified + sc.labelText;
+        const base = file.path + ':' + tail;
+        seen[base] = (seen[base] || 0) + 1;
+        sc.id = seen[base] === 1 ? base : base + '~' + seen[base];
+        sc.tail = sc.id.slice(file.path.length + 1);
+        sc.label = (sc.kind === 'X' ? 'extension ' : '') + sc.qualified + sc.labelText;
+        sc.depth = 0;
+        for (let p = sc.parent; p >= 0; p = file.scopes[p].parent) sc.depth++;
+        push(byQualified, sc.qualified, sc);
+        push(byName, sc.name, sc);
+        if (sc.callable) { push(byLabelled, sc.qualified + sc.labelText, sc); push(byLabelled, sc.name + sc.labelText, sc); }
+      });
+    });
+    const out = scopes.map(() => []), into = scopes.map(() => []);
+    index.edges.forEach((e) => { if (out[e[0]] && into[e[1]]) { out[e[0]].push(e); into[e[1]].push(e); } });
+    const trails = index.trails || [], trailById = Object.create(null), onTrail = Object.create(null);
+    trails.forEach((t) => {
+      trailById[t.id] = t;
+      t.steps.forEach((st) => st.entries.forEach((en, k) => push(onTrail, en.scope, { trail: t, step: st.n, pos: k })));
+    });
+    model = { index, files, scopes, byPath, byQualified, byName, byLabelled, out, into, trails, trailById, onTrail, missing, stripped: Object.create(null) };
+    return model;
+  }
+
+  /** Where an entry sits, as a sentence names it: "the boot trail". */
+  const placeName = (t) => 'the ' + t.title + ' trail';
+  const current = () => model.trailById[state.trail] || model.trails[0];
+  const placesOf = (sc) => (sc && model.onTrail[sc.g]) || [];
+  const onCurrent = (sc) => placesOf(sc).find((o) => o.trail === current()) || null;
+
+  function linesOf(file) {
+    if (!file.lines) {
+      file.lines = file.text.split('\n');
+      if (file.lines.length && file.lines[file.lines.length - 1] === '') file.lines.pop();
+    }
+    return file.lines;
+  }
+  const lastLine = (sc) => sc.end || sc.sig;
+  const firstLine = (sc) => (sc.doc ? Math.min(sc.doc[0], sc.decl) : sc.decl);
+  /** The innermost scope whose lines hold line n, or null. */
+  function scopeAt(file, n) {
+    let best = null;
+    file.scopes.forEach((sc) => {
+      if (firstLine(sc) <= n && n <= lastLine(sc) && (!best || sc.decl > best.decl || (sc.decl === best.decl && sc.local > best.local))) best = sc;
+    });
+    return best;
+  }
+  function dedent(lines) {
+    let pad = Infinity;
+    lines.forEach((l) => { if (l.trim()) pad = Math.min(pad, l.match(/^\s*/)[0].length); });
+    return lines.map((l) => l.slice(pad === Infinity ? 0 : pad));
+  }
+  function signature(sc) {
+    const lines = linesOf(sc.file), to = sc.brace ? sc.brace[0] : lastLine(sc), parts = [];
+    for (let n = sc.decl; n <= to; n++) {
+      let line = lines[n - 1] || '';
+      if (sc.brace && n === sc.brace[0]) line = line.slice(0, sc.brace[1]);
+      parts.push(line.replace(/\s+$/, ''));
+    }
+    return dedent(parts).join('\n');
+  }
+  function docText(sc) {
+    if (!sc.doc) return null;
+    return linesOf(sc.file).slice(sc.doc[0] - 1, sc.doc[1]).map((l) => l.replace(/^\s*\/\/\/ ?/, '')).join('\n');
+  }
+  function headerText(file, range) {
+    if (!range) return null;
+    return linesOf(file).slice(range[0] - 1, range[1]).map((l) => l.replace(/^\/\/(?:\s+(?:WHAT|PIN|IN|OUT):)?/, '').replace(/^ {0,8}/, '')).join('\n');
+  }
+  function kindWords(sc) {
+    const words = [];
+    if (sc.mods) words.push(sc.mods);
+    words.push(sc.flags & LOCAL && sc.kind === 'f' ? 'local func' : KIND[sc.kind]);
+    if (sc.flags & REQUIREMENT) words.push('protocol requirement');
+    if (sc.flags & OPERATOR) words.push('operator');
+    return words.join(' · ');
+  }
+
+  // MARK: - Find
+
+  function stripped(file) {
+    let m = model.stripped[file.path];
+    if (m) return m;
+    const chars = [], lines = [], text = file.text;
+    let line = 1;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (c === '\n') { line++; continue; }
+      if (c === ' ' || c === '\t' || c === '\r') continue;
+      chars.push(c);
+      lines.push(line);
+    }
+    m = model.stripped[file.path] = { text: chars.join(''), lines };
+    return m;
+  }
+  function labelsFrom(params) {
+    const found = [];
+    let depth = 0, cur = '';
+    for (let i = 0; i <= params.length; i++) {
+      const c = params[i];
+      if (c === '(' || c === '[' || c === '<') depth++;
+      else if (c === ')' || c === ']' || c === '>') depth--;
+      if ((c === ',' && depth === 0) || i === params.length) {
+        const before = cur.split(':')[0].trim().split(/\s+/).filter((w) => w[0] !== '@');
+        if (cur.indexOf(':') >= 0 && before[0]) found.push(before[0].replace(/`/g, ''));
+        cur = '';
+      } else cur += c;
+    }
+    return found;
+  }
+  const uniq = (list) => { const seen = Object.create(null); return list.filter((sc) => (seen[sc.g] ? false : (seen[sc.g] = true))); };
+  function findSymbol(q) {
+    const m = model;
+    let hits = [];
+    if (/\(/.test(q)) {
+      hits = (m.byLabelled[q] || []).slice();
+      if (!hits.length) m.scopes.forEach((sc) => { if (sc.callable && (sc.qualified + sc.labelText).slice(-q.length) === q) hits.push(sc); });
+    } else {
+      hits = (m.byQualified[q] || []).concat(q.indexOf('.') < 0 ? m.byName[q] || [] : []);
+      if (!hits.length && q.indexOf('.') > 0) m.scopes.forEach((sc) => { if (sc.qualified.slice(-q.length - 1) === '.' + q) hits.push(sc); });
+      const owner = q.slice(0, q.lastIndexOf('.')), member = q.slice(q.lastIndexOf('.') + 1);
+      hits = hits.concat(m.scopes.filter((sc) => sc.cases && q.indexOf('.') > 0 && sc.qualified === owner && sc.cases.indexOf(member) >= 0));
+    }
+    return uniq(hits);
+  }
+  function findSignature(line) {
+    const m = model;
+    let name = null, labels = null, kinds = null, r;
+    if ((r = /\bfunc\s+([^\s(<]+)\s*(?:<[^(]*>)?\s*\(([\s\S]*?)\)\s*(?:async|throws|rethrows|->|where|\{|$)/.exec(line))) { name = r[1].replace(/`/g, ''); labels = labelsFrom(r[2]); kinds = 'f'; }
+    else if ((r = /\binit[?!]?\s*(?:<[^(]*>)?\s*\(([\s\S]*?)\)/.exec(line))) { name = 'init'; labels = labelsFrom(r[1]); kinds = 'i'; }
+    else if ((r = /\bsubscript\s*\(([\s\S]*?)\)/.exec(line))) { name = 'subscript'; labels = labelsFrom(r[1]); kinds = 's'; }
+    else if ((r = /\bvar\s+`?(\w+)`?\s*:/.exec(line))) { name = r[1]; kinds = 'v'; }
+    else if ((r = /\b(struct|class|enum|protocol|actor)\s+`?(\w+)/.exec(line))) { name = r[2]; kinds = 'SCEPA'; }
+    else if ((r = /\bextension\s+([\w.]+)/.exec(line))) { name = r[1].split('.').pop(); kinds = 'X'; }
+    if (!name) return [];
+    let hits = (m.byName[name] || []).filter((sc) => kinds.indexOf(sc.kind) >= 0);
+    if (labels) {
+      const exact = hits.filter((sc) => sc.labels && sc.labels.join(':') === labels.join(':'));
+      if (exact.length) hits = exact;
+    }
+    const want = line.replace(/\s+/g, '').replace(/\{$/, '');
+    const same = hits.filter((sc) => { const sig = signature(sc).replace(/\s+/g, ''); return sig === want || sig.endsWith(want); });
+    return same.concat(hits.filter((sc) => same.indexOf(sc) < 0));
+  }
+  function findBody(q) {
+    const needle = q.replace(/\s+/g, '');
+    if (needle.length < 24) return [];
+    const hits = [];
+    model.files.forEach((file) => {
+      const s = stripped(file), at = s.text.indexOf(needle);
+      if (at < 0) return;
+      const first = s.lines[at], last = s.lines[at + needle.length - 1];
+      let sc = null;
+      file.scopes.forEach((c) => { if (firstLine(c) <= first && last <= lastLine(c) && (!sc || c.decl > sc.decl)) sc = c; });
+      hits.push(sc ? { sc, line: first } : { file, line: first });
+    });
+    return hits;
+  }
+  function findLoose(q) {
+    const low = q.toLowerCase(), ranked = [];
+    model.scopes.forEach((sc) => {
+      const name = sc.name.toLowerCase(), qual = sc.qualified.toLowerCase(), file = sc.file.name.toLowerCase();
+      const rank = name === low || qual === low ? 0 : name.indexOf(low) === 0 ? 1 : qual.indexOf(low) >= 0 ? 2 : file.indexOf(low) >= 0 && sc.parent < 0 ? 3 : -1;
+      if (rank >= 0) ranked.push({ sc, rank });
+    });
+    ranked.sort((a, b) => a.rank - b.rank || a.sc.qualified.length - b.sc.qualified.length || a.sc.g - b.sc.g);
+    const files = model.files.filter((f) => !f.scopes.length && f.name.toLowerCase().indexOf(low) >= 0).map((f) => ({ file: f, line: 1 }));
+    return ranked.map((r) => r.sc).concat(files);
+  }
+  const DECLARES = /\b(func|init|subscript|var|struct|class|enum|protocol|actor|extension)\b/;
+  /** Results for a query, best first: [{ sc, line?, file?, how }]. */
+  function search(rawText) {
+    const q = (rawText || '').trim();
+    if (!q || !build()) return [];
+    const multi = /\n/.test(q), found = [];
+    const add = (list, how) => list.forEach((x) => found.push(x.g !== undefined ? { sc: x, how } : Object.assign({ how }, x)));
+    if (!multi && /^[\w.<>=!+\-*/%&|^~?`]+(\([\w:]*\))?$/.test(q)) add(findSymbol(q.replace(/`/g, '')), 'by name');
+    if (!found.length && DECLARES.test(q)) {
+      if (multi) add(findBody(q), 'by its text');
+      if (!found.length) add(findSignature(q.split('\n').filter((l) => DECLARES.test(l))[0] || q), 'by its signature');
+    }
+    if (!found.length) add(findBody(q), 'by its text');
+    if (!found.length && !multi) add(findLoose(q), 'by part of its name');
+    const seen = Object.create(null);
+    return found.filter((r) => { const key = r.sc ? 's' + r.sc.g : 'f' + r.file.path + r.line; return seen[key] ? false : (seen[key] = true); });
+  }
+
+  // MARK: - Targets: what a route names
+
+  /** A route's target → what it names: { trail, step, pos }, { query }, { file, line, sc }, or null. */
+  function parseTarget(t) {
+    const m = build();
+    if (!m || !t) return null;
+    if (t.trail) {
+      const tr = m.trailById[t.trail], n = +(t.step || 1);
+      if (!tr || n < 1 || n > tr.steps.length) return null;
+      return { trail: tr.id, step: n, pos: t.pos ? Math.max(0, Math.min(+t.pos - 1, tr.steps[n - 1].entries.length - 1)) : 0 };
+    }
+    if (t.query !== undefined) return { query: t.query };
+    if (t.path) {
+      const file = m.byPath[t.path];
+      if (!file) return null;
+      if (!t.at) return { file };
+      if (/^\d+$/.test(t.at)) return { file, line: +t.at, sc: scopeAt(file, +t.at) };
+      let hit = file.scopes.filter((sc) => sc.tail === t.at);
+      if (!hit.length) hit = file.scopes.filter((sc) => sc.qualified === t.at);
+      return hit.length === 1 ? { file, sc: hit[0], line: hit[0].sig } : { file };
+    }
+    return null;
+  }
+
+  // MARK: - The view
+
+  let ui = null;
+  const state = { file: null, sc: null, trail: null, step: 0, pos: -1, lastPos: 0, at: Object.create(null), only: false, results: [], active: 0 };
+
+  function mount() {
+    const m = model;
+    ui = { root: h('div', { class: 'xp', 'aria-label': 'The Explorer' }) };
+    const kept = Arch.store.get('explorer.trail', '');
+    state.trail = m.trailById[kept] ? kept : (m.trails[0] || {}).id || null;
+    ui.root.appendChild(statusLine());
+    ui.root.appendChild(findBox());
+    ui.root.appendChild(trailStrip());
+    ui.root.appendChild(servicesStrip());
+    ui.root.appendChild(treePanel());
+    ui.root.appendChild(sourcePanel());
+    const hint = (keys, says) => h('span', null, [keys.map((k, i) => [i ? ' ' : null, h('kbd', null, k)]), ' ' + says]);
+    ui.root.appendChild(h('p', { class: 'xp-keys' }, ['Keys: ', hint(['[', ']'], 'walk the chosen trail'), ' · ',
+      hint(['↑', '↓'], 'in the source move between declarations'), ' · ', hint(['Esc'], 'clears the find box'), ' · ',
+      hint(['⌘K'], 'searches the whole site.')]));
+    ui.card = h('div', { class: 'xp-card', 'aria-live': 'polite', 'aria-label': 'The selected declaration' });
+    ui.root.addEventListener('keydown', onKey);
+    document.addEventListener('keydown', (e) => {
+      if (!Arch.isExplorerRoute(Arch.route) || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.target.matches('input, textarea, select') || e.target.isContentEditable || ui.root.contains(e.target)) return;
+      if (e.key === ']' || e.key === '[') { stepBy(e.key === ']' ? 1 : -1); e.preventDefault(); }
+    });
+    window.addEventListener('resize', fitTree);
+  }
+
+  /** Puts the view's own elements back where Arch.render left room for them, with their scroll restored. */
+  function attach(host, cardHost) {
+    host.replaceChildren(ui.root);
+    cardHost.replaceChildren(ui.card);
+    if (ui.preScroll) ui.pre.scrollTop = ui.preScroll;
+    if (ui.treeScroll) ui.tree.scrollTop = ui.treeScroll;
+    fitTree();
+  }
+
+  /** The Explorer's own target for a route: a file with its line or declaration, a step of a trail, a search; none for
+   *  the Explorer itself. */
+  function targetOf(route) {
+    if (!route) return null;
+    if (route.view === 'path' && route.kind === 'file') return { path: route.path, at: route.target };
+    if (route.view === 'find') return { query: route.rest };
+    if (route.view === 'trail') {
+      const [id, rest] = [route.parts[0], route.parts[1] || ''];
+      const m = /^(\d+)?(?:;n=(\d+))?$/.exec(rest) || [];
+      return id ? { trail: id, step: m[1] || 1, pos: m[2] } : null;
+    }
+    return null;
+  }
+  function go(target, first) {
+    if (!target && Arch.route && Arch.route.view === 'explorer') {
+      if (!state.sc && !state.file && model.trails.length) walk(1, 0, { hash: false, quiet: true });
+      renderCard();
+      renderTrail();
+      return;
+    }
+    const t = parseTarget(target);
+    // A trail the site does not have: the walk starts on the first one it does.
+    if (target && target.trail && !t && model.trails.length) { walkTo(model.trails[0].id, 1, 0, { from: 'hash', quiet: first }); return; }
+    if (t && t.query !== undefined) { ui.find.value = t.query; fitFind(); runSearch(true); return; }
+    if (t && t.step) { walkTo(t.trail, t.step, t.pos, { hash: false, from: 'hash', quiet: first }); return; }
+    if (t && t.sc) { select(t.sc, { hash: false, from: 'hash', line: t.line, quiet: first }); return; }
+    if (t && t.file) { open(t.file); state.sc = null; if (state.step) state.pos = -1; mark(null); if (t.line) flash(t.line); renderCard(); renderTrail(); return; }
+    renderCard();
+    renderTrail();
+  }
+
+  function statusLine() {
+    const m = model, c = m.index.counts;
+    const notes = [];
+    if (m.missing.length) notes.push('Missing: explorer/' + m.missing.map((x) => Arch.own(m.index.units, x)).join('.js, explorer/') + '.js. To write them, ' + REBUILD + '.');
+    const check = h('details', { class: 'xp-check' }, h('summary', null, 'Self-check'));
+    check.addEventListener('toggle', () => {
+      if (!check.open || check.querySelector('ul')) return;
+      const results = selfCheck(), failed = results.filter((r) => !r.ok).length;
+      check.appendChild(h('p', null, failed ? failed + ' of ' + results.length + ' checks failed.' : 'All ' + results.length + ' checks pass.'));
+      check.appendChild(h('ul', null, results.map((r) => h('li', { class: r.ok ? 'ok' : 'bad' }, [r.ok ? '✓ ' : '✗ ', r.name, r.detail ? h('small', null, ' · ' + r.detail) : null]))));
+    });
+    return h('div', { class: 'xp-status' }, [
+      h('span', null, Arch.fmt.n(c.files) + ' files · ' + Arch.fmt.n(c.lines) + ' lines · ' + Arch.fmt.n(c.scopes) + ' declarations · ' +
+        Arch.fmt.n(m.index.edges.length) + ' calls matched' + (m.index.commit ? ' · at ' + m.index.commit : '')), check,
+    ].concat(notes.map((n) => h('p', { class: 'xp-stale' }, n))));
+  }
+
+  function findBox() {
+    ui.find = h('textarea', { rows: 1, spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Find a declaration', 'aria-controls': 'xp-results',
+                              placeholder: 'Type.method, a signature line, or a whole function body' });
+    ui.results = h('ol', { class: 'xp-results', id: 'xp-results', role: 'listbox', hidden: true, 'aria-label': 'Matches' });
+    let timer = null, pasted = false;
+    ui.find.addEventListener('paste', () => { pasted = true; });
+    ui.find.addEventListener('input', () => {
+      clearTimeout(timer);
+      fitFind();
+      timer = setTimeout(() => { runSearch(pasted); pasted = false; }, 120);
+    });
+    ui.find.addEventListener('keydown', (e) => {
+      const single = ui.find.value.indexOf('\n') < 0, shown = !ui.results.hidden && state.results.length;
+      if (e.key === 'Escape') { ui.find.value = ''; fitFind(); runSearch(false); ui.pre.focus({ preventScroll: true }); e.preventDefault(); }
+      else if (shown && single && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) { activate(state.active + (e.key === 'ArrowDown' ? 1 : -1)); e.preventDefault(); }
+      else if (shown && e.key === 'Enter' && (single || e.metaKey || e.ctrlKey) && !e.shiftKey) { choose(state.active); e.preventDefault(); }
+      if (!(e.metaKey || e.ctrlKey)) e.stopPropagation();
+    });
+    return h('div', { class: 'xp-find' }, [
+      h('label', { class: 'xp-find-label' }, [h('span', null, 'Find'), ui.find]),
+      h('p', { class: 'xp-hint' }, 'A name, Type.method, a signature line, or a whole body pasted from the editor; indentation does not matter.'),
+      ui.results,
+    ]);
+  }
+  function fitFind() { ui.find.rows = Math.min(6, Math.max(1, ui.find.value.split('\n').length)); }
+  function runSearch(jump) {
+    const q = ui.find.value;
+    state.results = search(q);
+    state.active = 0;
+    ui.results.textContent = '';
+    if (!q.trim()) { ui.results.hidden = true; ui.find.removeAttribute('aria-activedescendant'); return; }
+    ui.results.hidden = false;
+    if (!state.results.length) {
+      ui.results.appendChild(h('li', { class: 'xp-none' }, 'Nothing in the code matches. Try the bare function name, or paste the whole signature line.'));
+      return;
+    }
+    state.results.slice(0, 30).forEach((r, k) => {
+      const sc = r.sc, where = sc ? sc.file : r.file;
+      const li = h('li', { role: 'option', id: 'xp-opt-' + k, 'aria-selected': k === 0 ? 'true' : 'false' }, [
+        h('b', null, sc ? sc.label : where.name),
+        h('small', null, (sc ? KIND[sc.kind] + ' · ' : '') + where.module + ' · ' + where.name + ':' + (r.line || (sc ? sc.sig : 1)) + ' · found ' + r.how),
+      ]);
+      li.addEventListener('mousedown', (e) => e.preventDefault());
+      li.addEventListener('click', () => choose(k));
+      ui.results.appendChild(li);
+    });
+    if (state.results.length > 30) ui.results.appendChild(h('li', { class: 'xp-none' }, 'and ' + (state.results.length - 30) + ' more'));
+    ui.find.setAttribute('aria-activedescendant', 'xp-opt-0');
+    if (jump && state.results.length) choose(0, { keepFocus: true });
+  }
+  function activate(k) {
+    const n = Math.min(state.results.length, 30);
+    if (!n) return;
+    state.active = (k + n) % n;
+    ui.results.querySelectorAll('[role=option]').forEach((li, i) => li.setAttribute('aria-selected', i === state.active ? 'true' : 'false'));
+    ui.find.setAttribute('aria-activedescendant', 'xp-opt-' + state.active);
+    const li = ui.results.querySelector('#xp-opt-' + state.active);
+    if (li) li.scrollIntoView({ block: 'nearest' });
+  }
+  function choose(k, opts) {
+    const r = state.results[k];
+    if (!r) return;
+    if (r.sc) select(r.sc, { line: r.line, from: 'find' });
+    else { open(r.file); flash(r.line); writeHash(); }
+    if (!(opts && opts.keepFocus)) ui.pre.focus({ preventScroll: true });
+  }
+
+  // MARK: - The trails
+
+  function trailStrip() {
+    const m = model;
+    const head = m.index.loop || { title: 'Trails', subtitle: '', say: '' };
+    ui.trailButtons = m.trails.map((t) => {
+      const b = h('button', { type: 'button', 'data-trail': t.id, 'aria-pressed': 'false', title: t.say },
+                  [h('span', { class: 'xp-badge' }, t.mark), ' ', h('span', { class: 'xp-trail-name' }, t.title), h('span', { class: 'xp-trail-sub' }, t.subtitle)]);
+      b.addEventListener('click', () => chooseTrail(t.id));
+      return b;
+    });
+    ui.stepList = h('ol', { class: 'xp-steps' });
+    ui.say = h('p', { class: 'xp-say' });
+    ui.prev = h('button', { type: 'button', class: 'button xp-walk' }, '← previous');
+    ui.next = h('button', { type: 'button', class: 'button xp-walk' }, 'next →');
+    ui.prev.addEventListener('click', () => stepBy(-1));
+    ui.next.addEventListener('click', () => stepBy(1));
+    if (!m.trails.length) return h('div', { class: 'xp-trail' }, h('p', { class: 'xp-loop' }, [h('b', null, head.title), ' · ' + (head.say || 'No trail: the code declares no Granite services to derive one from, and the call named none.')]));
+    return h('div', { class: 'xp-trail' }, [
+      h('p', { class: 'xp-loop', title: head.say }, [h('b', null, head.title), ' · ' + head.subtitle]),
+      h('div', { class: 'xp-trails', role: 'group', 'aria-label': 'The trails' }, ui.trailButtons),
+      ui.stepList,
+      h('div', { class: 'xp-say-row' }, [ui.say, h('span', { class: 'xp-walks' }, [ui.prev, ui.next])]),
+    ]);
+  }
+  /** The walked trail's step buttons, rebuilt when the trail changes. */
+  function stepButtons() {
+    const t = current();
+    if (!t || ui.stepsOf === t.id) return;
+    ui.stepsOf = t.id;
+    ui.stepList.textContent = '';
+    ui.stepList.setAttribute('aria-label', 'The ' + t.title + ' trail, step by step');
+    ui.steps = t.steps.map((st) => {
+      const b = h('button', { type: 'button', 'data-step': st.n, 'aria-pressed': 'false', title: st.title },
+                  [h('span', { class: 'xp-n' }, String(st.n)), h('span', { class: 'xp-t' }, st.title)]);
+      b.addEventListener('click', () => walk(st.n, 0, { from: 'trail' }));
+      const li = h('li', null, b);
+      ui.stepList.appendChild(li);
+      return li;
+    });
+  }
+  function renderTrail() {
+    const t = current();
+    if (!t || !ui.steps && !ui.stepList) return;
+    stepButtons();
+    ui.trailButtons.forEach((b) => b.setAttribute('aria-pressed', b.getAttribute('data-trail') === t.id ? 'true' : 'false'));
+    ui.steps.forEach((li, k) => li.firstChild.setAttribute('aria-pressed', state.step === k + 1 ? 'true' : 'false'));
+    ui.say.textContent = '';
+    if (!state.step) {
+      ui.say.appendChild(document.createTextNode(t.say + ' Pick a step.'));
+    } else {
+      const st = t.steps[state.step - 1];
+      if (state.pos >= 0) {
+        ui.say.appendChild(h('b', null, 'Step ' + st.n + ' of ' + t.steps.length));
+        ui.say.appendChild(document.createTextNode(' · ' + st.title + ' · function ' + (state.pos + 1) + ' of ' + st.entries.length));
+        const hop = st.entries[state.pos].hop;
+        if (hop) { ui.say.appendChild(document.createTextNode(' · ')); ui.say.appendChild(h('span', { class: 'xp-hop-word', 'data-via': hop[0] }, '← ' + (FLOW_WORD[hop[0]] || hop[0]))); }
+      } else {
+        const back = h('button', { type: 'button', class: 'xp-link' }, 'back to function ' + (state.lastPos + 1));
+        back.addEventListener('click', () => walk(state.step, state.lastPos, { from: 'trail' }));
+        ui.say.appendChild(document.createTextNode('Step ' + st.n + ' · off ' + placeName(t) + ' · '));
+        ui.say.appendChild(back);
+        const other = placesOf(state.sc)[0];
+        if (other) {
+          const there = h('button', { type: 'button', class: 'xp-link' }, 'this one is on ' + placeName(other.trail) + ', step ' + other.step);
+          there.addEventListener('click', () => walkTo(other.trail.id, other.step, other.pos, { from: 'trail' }));
+          ui.say.appendChild(document.createTextNode(' · '));
+          ui.say.appendChild(there);
+        }
+      }
+    }
+    const end = t.steps[t.steps.length - 1];
+    ui.prev.disabled = !state.step || (state.step === 1 && state.pos === 0);
+    ui.next.disabled = state.step === t.steps.length && state.pos === end.entries.length - 1;
+    ui.root.setAttribute('data-trail', t.id);
+    ui.root.setAttribute('data-step', String(state.step));
+  }
+  /** Walks another trail: the selection stays when it is on that trail too; otherwise the walk resumes where it last
+   *  stood there, or at its first function. */
+  function chooseTrail(id, opts) {
+    const t = model.trailById[id];
+    if (!t || (t === current() && state.step)) return;
+    setTrail(id);
+    const on = onCurrent(state.sc);
+    if (on) {
+      Object.assign(state, { step: on.step, pos: on.pos, lastPos: on.pos });
+      state.at[id] = { step: on.step, pos: on.pos };
+      renderCard();
+      renderTrail();
+      if (!opts || opts.hash !== false) writeHash();
+      return;
+    }
+    const at = state.at[id] || { step: 1, pos: 0 };
+    walk(at.step, at.pos, Object.assign({ from: 'trail' }, opts || {}));
+  }
+  function setTrail(id) {
+    if (state.trail === id) return;
+    state.trail = id;
+    Arch.store.set('explorer.trail', id);
+  }
+  function walk(n, k, opts) {
+    const t = current(), st = t && t.steps[n - 1];
+    if (!st) return;
+    k = Math.max(0, Math.min(k, st.entries.length - 1));
+    Object.assign(state, { step: n, pos: k, lastPos: k });
+    state.at[t.id] = { step: n, pos: k };
+    const entry = st.entries[k];
+    select(model.scopes[entry.scope], Object.assign({ trail: true, line: entry.line }, opts || {}));
+  }
+  function walkTo(id, n, k, opts) { setTrail(id); walk(+n, +k || 0, opts); }
+  function stepBy(d) {
+    const t = current();
+    if (!t) return undefined;
+    if (!state.step) return walk(1, 0, { from: 'trail' });
+    if (state.pos < 0) return walk(state.step, state.lastPos, { from: 'trail' });
+    let k = state.pos + d, n = state.step;
+    if (k >= t.steps[n - 1].entries.length) { if (n < t.steps.length) { n++; k = 0; } else return undefined; }
+    if (k < 0) { if (n > 1) { n--; k = t.steps[n - 1].entries.length - 1; } else return undefined; }
+    return walk(n, k, { from: 'trail' });
+  }
+
+  // MARK: - The services, by rank
+
+  function servicesStrip() {
+    const m = model, services = m.index.services || [], components = m.index.components || [];
+    if (!services.length && !components.length) return h('div', { class: 'xp-services', hidden: true });
+    const row = (s, rank) => {
+      const name = h('button', { type: 'button', class: 'xp-link xp-sv', title: 'Its declaration' }, s.name);
+      name.addEventListener('click', () => { const sc = m.scopes[s.g]; if (sc) select(sc, { from: 'services' }); });
+      const chips = s.events.map((e) => {
+        const b = h('button', { type: 'button', class: 'chip mono', title: e[1] + (e[2].length ? '' : ' · no reducer found') }, e[0] + ' → ' + e[1]);
+        b.addEventListener('click', () => { const sc = m.scopes[e[2][0]]; if (sc) select(sc, { from: 'services' }); });
+        return b;
+      });
+      return h('li', { 'data-service': s.name }, [rank != null ? h('span', { class: 'xp-rank', title: 'rank' }, String(rank)) : null, name, chips.length ? chips : h('span', { class: 'faint' }, 'no events'),
+        s.relays && s.relays.length ? h('span', { class: 'xp-relays' }, (rank != null ? 'reaches ' : 'reads ') + s.relays.join(', ')) : null]);
+    };
+    const open = Arch.store.get('explorer.services', true);
+    const box = h('details', { class: 'xp-services', open: open ? true : null }, [
+      h('summary', null, [h('b', null, 'Services'), ' · ' + services.length + ' by rank, ' + services.reduce((a, s) => a + s.events.length, 0) + ' events' +
+        (components.length ? ' · ' + components.length + ' components' : '')]),
+      h('ol', { class: 'xp-service-list', 'aria-label': 'The services, lowest rank first, each with its events' }, services.map((s) => row(s, s.rank))),
+      components.length ? h('p', { class: 'xp-loop', style: 'margin-top:10px' }, [h('b', null, 'Components'), ' · each with the services it reads and its own events']) : null,
+      components.length ? h('ol', { class: 'xp-service-list', 'aria-label': 'The components, each with its events' }, components.map((s) => row(s, null))) : null,
+    ]);
+    box.addEventListener('toggle', () => Arch.store.set('explorer.services', box.open));
+    return box;
+  }
+
+  // MARK: - The tree
+
+  function treePanel() {
+    const m = model, roots = Object.create(null);
+    const ROOT = '.';
+    m.files.forEach((file) => {
+      const parts = file.path.split('/');
+      const top = parts.length > 1 ? parts[0] : ROOT;
+      let node = roots[top] = roots[top] || { key: top, folders: Object.create(null), files: [] };
+      for (let i = 1; i < parts.length - 1; i++) {
+        const key = node.key + '/' + parts[i];
+        node = node.folders[parts[i]] = node.folders[parts[i]] || { key, folders: Object.create(null), files: [] };
+      }
+      node.files.push(file);
+    });
+    const remembered = Object.assign(Object.create(null), Arch.store.get('explorer.open', {}) || {});
+    ui.fileNodes = Object.create(null);
+    const count = (node) => node.files.length + Object.values(node.folders).reduce((a, f) => a + count(f), 0);
+    const remember = (d, key) => d.addEventListener('toggle', () => {
+      const openNow = Arch.store.get('explorer.open', {}) || {};
+      if (d.open) openNow[key] = true; else delete openNow[key];
+      Arch.store.set('explorer.open', openNow);
+    });
+    function folder(label, node) {
+      const page = h('a', { class: 'xp-folder-link', href: Arch.href.folder(node.key), title: (node.key === ROOT ? 'the project' : node.key) + ', its page' }, '↗');
+      const d = h('details', { class: 'xp-node', 'data-node': node.key, open: remembered[node.key] ? true : null },
+                  h('summary', null, [h('span', { class: 'xp-fname' }, label), page, h('small', null, count(node) + ' files')]));
+      const list = h('div', { class: 'xp-kids' });
+      Object.keys(node.folders).sort().forEach((k) => list.appendChild(folder(k, node.folders[k])));
+      node.files.slice().sort((a, b) => (a.name < b.name ? -1 : 1)).forEach((f) => list.appendChild(fileNode(f)));
+      d.appendChild(list);
+      remember(d, node.key);
+      return d;
+    }
+    function fileNode(file) {
+      // One badge a trail, naming every step of it that reads this file: B2,5.
+      const steps = Object.create(null);
+      file.scopes.forEach((sc) => placesOf(sc).forEach((o) => { const s = steps[o.trail.id] = steps[o.trail.id] || []; if (s.indexOf(o.step) < 0) s.push(o.step); }));
+      const marks = m.trails.filter((t) => steps[t.id]).map((t) => {
+        const list = steps[t.id].sort((a, b) => a - b);
+        return h('span', { class: 'xp-badge', 'data-trail': t.id, title: 'On ' + placeName(t) + ' at step' + (list.length > 1 ? 's ' : ' ') + list.join(', ') }, t.mark + list.join(','));
+      });
+      const d = h('details', { class: 'xp-file', 'data-file': file.path, open: remembered[file.path] ? true : null },
+                  h('summary', { title: file.summary || file.path }, [h('span', { class: 'xp-fname' }, file.name), marks, h('small', null, file.scopes.length ? String(file.scopes.length) : file.lang === 'Swift' ? '0' : file.lang)]));
+      d.querySelector('summary').addEventListener('click', () => open(file, { from: 'tree' }));
+      d.addEventListener('toggle', () => { if (d.open) scopeList(file); });
+      if (d.open) scopeList(file);
+      remember(d, file.path);
+      ui.fileNodes[file.path] = d;
+      return d;
+    }
+    const tops = m.index.modules.filter((k) => roots[k]).map((k) => folder(k === ROOT ? Arch.data.meta.title : k, roots[k]));
+    ui.treeLabel = h('span', null, 'Files');
+    ui.files = h('details', { class: 'xp-files', open: true }, [h('summary', null, ui.treeLabel), h('div', { class: 'xp-tree-inner' }, tops)]);
+    ui.tree = h('nav', { class: 'xp-tree', 'aria-label': 'Every file of code, by folder' }, ui.files);
+    ui.tree.addEventListener('scroll', () => { ui.treeScroll = ui.tree.scrollTop; }, { passive: true });
+    return ui.tree;
+  }
+  function fitTree() {
+    const narrow = window.innerWidth <= NARROW;
+    if (ui && ui.files && ui.narrow !== narrow) { ui.files.open = !narrow; ui.narrow = narrow; }
+  }
+  function scopeList(file) {
+    const d = ui.fileNodes[file.path];
+    if (!d || d.querySelector('ul') || !file.scopes.length) return;
+    const ul = h('ul', { class: 'xp-scopes' });
+    file.scopes.forEach((sc) => {
+      const b = h('button', { type: 'button', 'data-fn': sc.id, style: 'padding-left:' + (0.4 + sc.depth * 0.75) + 'rem', title: sc.label },
+                  [h('span', { class: 'xp-kind' }, TAG[sc.kind]), h('span', { class: 'xp-sname' }, sc.name + sc.labelText)].concat(badges(placesOf(sc))));
+      b.addEventListener('click', () => select(sc, { from: 'tree' }));
+      ul.appendChild(h('li', null, b));
+    });
+    d.appendChild(ul);
+  }
+  const badges = (places) => places.map((o) => h('span', { class: 'xp-badge', 'data-trail': o.trail.id, title: 'On ' + placeName(o.trail) + ' at step ' + o.step }, o.trail.mark + o.step));
+
+  // MARK: - The source
+
+  function sourcePanel() {
+    ui.path = h('span', { class: 'xp-path' }, '');
+    ui.copyLine = h('button', { type: 'button', class: 'button', title: 'Copy File.swift:line, which the editor’s Go to File accepts' }, 'Copy line');
+    ui.copyLink = h('button', { type: 'button', class: 'button', title: 'Copy a link to this place in the Explorer' }, 'Copy link');
+    ui.editor = h('a', { class: 'button', title: 'Open this line in the editor (set the editor in the settings at the top)' }, 'Open in editor ↗');
+    ui.onlyButton = h('button', { type: 'button', class: 'button', 'aria-pressed': 'false', title: 'Show only the selected declaration' }, 'Only this declaration');
+    ui.copyLine.addEventListener('click', () => { const at = here(); if (at) Arch.copy(at.file.name + ':' + at.line); });
+    ui.copyLink.addEventListener('click', () => Arch.copy(location.href.split('#')[0] + hashFor()));
+    ui.onlyButton.addEventListener('click', () => { state.only = !state.only; Arch.store.set('explorer.only', state.only); applyOnly(); });
+    state.only = !!Arch.store.get('explorer.only', false);
+    ui.pre = h('pre', { tabindex: '0', 'aria-label': 'Source' });
+    ui.pre.addEventListener('scroll', () => { ui.preScroll = ui.pre.scrollTop; }, { passive: true });
+    ui.pre.addEventListener('click', (e) => {
+      const rowEl = e.target.closest && e.target.closest('.ln');
+      if (!rowEl || !state.file || String(window.getSelection ? window.getSelection() : '')) return;
+      const sc = scopeAt(state.file, +rowEl.getAttribute('data-n'));
+      if (sc && sc !== state.sc) select(sc, { from: 'source', scroll: false });
+    });
+    ui.source = h('section', { class: 'xp-source', 'aria-label': 'The open file' }, [
+      h('div', { class: 'xp-code-head' }, [ui.path, h('span', { class: 'xp-tools' }, [ui.copyLine, ui.copyLink, ui.editor, ui.onlyButton])]), ui.pre]);
+    return ui.source;
+  }
+  const here = () => (state.sc ? { file: state.sc.file, line: state.sc.sig } : state.file ? { file: state.file, line: 1 } : null);
+  function syncEditor() {
+    const at = here(), href = at && Arch.editorHref(at.file.path, at.line);
+    if (href) { ui.editor.setAttribute('href', href); ui.editor.removeAttribute('aria-disabled'); }
+    else { ui.editor.removeAttribute('href'); ui.editor.setAttribute('aria-disabled', 'true'); }
+  }
+  function open(file, opts) {
+    if (!file) return;
+    if (state.file !== file) {
+      state.file = file;
+      renderSource(file);
+      ui.path.textContent = file.path;
+      ui.pre.setAttribute('aria-label', 'Source of ' + file.name);
+      ui.treeLabel.textContent = 'Files · ' + file.name;
+      ui.root.setAttribute('data-file', file.path);
+    }
+    if (opts && opts.from === 'tree') {
+      if (state.sc && state.sc.file !== file) { state.sc = null; mark(null); }
+      renderCard();
+      writeHash();
+    }
+    syncEditor();
+  }
+  function renderSource(file) {
+    const lines = linesOf(file), frag = document.createDocumentFragment(), starts = {};
+    let inString = false;
+    file.scopes.forEach((sc) => { if (!starts[sc.decl]) starts[sc.decl] = sc; });
+    ui.rows = [];
+    lines.forEach((line, i) => {
+      const n = i + 1, quotes = (line.match(/"""/g) || []).length;
+      const body = inString ? h('span', { class: 'tk-s' }, line) : Arch.highlight(line);
+      const r = h('div', { class: 'ln' + (starts[n] ? ' sc' : ''), 'data-n': n, id: 'L' + n }, [h('span', null, String(n)), h('span', null, body)]);
+      if (starts[n]) r.setAttribute('data-fn', starts[n].id);
+      if (quotes % 2) inString = !inString;
+      ui.rows.push(r);
+      frag.appendChild(r);
+    });
+    ui.pre.replaceChildren(frag);
+    ui.marked = [];
+    ui.pre.scrollTop = 0;
+    ui.preScroll = 0;
+  }
+  const row = (n) => ui.rows[n - 1] || null;
+  function mark(sc) {
+    (ui.marked || []).forEach((r) => r.classList.remove('hl', 'sig', 'doc'));
+    ui.marked = [];
+    if (!sc) { applyOnly(); return; }
+    for (let n = sc.doc ? sc.doc[0] : sc.decl; n <= lastLine(sc); n++) {
+      const r = row(n);
+      if (!r) continue;
+      r.classList.add('hl');
+      if (sc.doc && n <= sc.doc[1]) r.classList.add('doc');
+      if (n === sc.sig) r.classList.add('sig');
+      ui.marked.push(r);
+    }
+    applyOnly();
+  }
+  function applyOnly() {
+    ui.onlyButton.setAttribute('aria-pressed', state.only ? 'true' : 'false');
+    ui.pre.querySelectorAll('.xp-gap').forEach((g) => g.remove());
+    const sc = state.sc, from = sc ? (sc.doc ? sc.doc[0] : sc.decl) : 1, to = sc ? lastLine(sc) : ui.rows.length;
+    const hiding = state.only && sc;
+    let run = 0;
+    ui.rows.forEach((r, i) => {
+      const n = i + 1, hide = hiding && (n < from || n > to);
+      r.hidden = !!hide;
+      if (hide) run++;
+      if ((!hide || n === ui.rows.length) && run) {
+        const gap = h('div', { class: 'xp-gap', 'aria-hidden': 'true' }, '… ' + run + (run === 1 ? ' line' : ' lines'));
+        if (hide) r.after(gap); else r.before(gap);
+        run = 0;
+      }
+    });
+  }
+  function scrollRow(r, where) {
+    if (!r || r.hidden) return;
+    const p = ui.pre.getBoundingClientRect(), b = r.getBoundingClientRect();
+    if (b.top < p.top || b.bottom > p.bottom - 8 || where === 'top') ui.pre.scrollTop += b.top - p.top - Math.min(p.height / 4, 80);
+    ui.preScroll = ui.pre.scrollTop;
+  }
+  function flash(n) {
+    const r = row(n);
+    if (!r) return;
+    if (r.hidden) { state.only = false; applyOnly(); }
+    scrollRow(r, 'top');
+    r.classList.add('flash');
+    setTimeout(() => r.classList.remove('flash'), 1600);
+  }
+
+  function select(sc, opts) {
+    opts = opts || {};
+    if (!sc) return;
+    open(sc.file);
+    state.sc = sc;
+    if (!opts.trail) {
+      const on = onCurrent(sc);
+      if (on) { Object.assign(state, { step: on.step, pos: on.pos, lastPos: on.pos }); state.at[state.trail] = { step: on.step, pos: on.pos }; }
+      else if (state.step) state.pos = -1;
+    }
+    mark(sc);
+    syncEditor();
+    if (opts.scroll !== false) scrollRow(row(sc.doc ? sc.doc[0] : sc.decl), 'top');
+    if (opts.line && opts.line !== sc.decl && opts.line !== sc.sig) flash(opts.line);
+    revealInTree(sc);
+    renderCard();
+    renderTrail();
+    ui.root.setAttribute('data-scope', sc.id);
+    ui.root.setAttribute('data-line', String(sc.sig));
+    window.dispatchEvent(new CustomEvent('docs:context'));
+    if (opts.hash !== false) writeHash();
+    Arch.store.set('explorer.last', { path: sc.file.path, at: sc.tail });
+    if (!opts.quiet && window.innerWidth <= NARROW && ['find', 'trail', 'hash', 'services'].indexOf(opts.from) >= 0) ui.source.scrollIntoView({ block: 'start' });
+  }
+  function revealInTree(sc) {
+    const d = ui.fileNodes[sc.file.path];
+    if (!d) return;
+    for (let p = d; p && p !== ui.tree; p = p.parentElement) if (p.tagName === 'DETAILS' && !p.open && p !== ui.files) p.open = true;
+    scopeList(sc.file);
+    ui.tree.querySelectorAll('[aria-current]').forEach((b) => b.removeAttribute('aria-current'));
+    const b = d.querySelector('[data-fn="' + CSS.escape(sc.id) + '"]');
+    if (!b) return;
+    b.setAttribute('aria-current', 'true');
+    if (ui.narrow || !ui.tree.isConnected) return;
+    const t = ui.tree.getBoundingClientRect(), r = b.getBoundingClientRect();
+    if (r.top < t.top || r.bottom > t.bottom) { ui.tree.scrollTop += r.top - t.top - t.height / 3; ui.treeScroll = ui.tree.scrollTop; }
+  }
+
+  // MARK: - The card, in the inspector
+
+  function renderCard() {
+    const card = ui.card, sc = state.sc;
+    card.textContent = '';
+    if (!sc) {
+      card.appendChild(h('p', { class: 'eyebrow' }, 'Explorer'));
+      card.appendChild(h('p', { class: 'xp-empty' }, state.file ? (state.file.scopes.length ? 'Pick a declaration in ' + state.file.name + ', in the tree or in the source.' : state.file.name + ' is ' + state.file.lang + ': its text, with no declarations read.') : 'Pick a file in the tree, a step on a trail, a service’s event, or paste a function into the find box.'));
+      if (state.file) card.appendChild(fileBlock(state.file));
+      return;
+    }
+    const parent = sc.parent >= 0 ? sc.file.scopes[sc.parent] : null;
+    card.appendChild(h('p', { class: 'eyebrow' }, KIND[sc.kind] + ' · ' + sc.file.module));
+    card.appendChild(h('h2', { class: 'xp-title' }, sc.label));
+    card.appendChild(h('p', { class: 'xp-kindline' }, [kindWords(sc), ' · ', sc.file.name + ':' + sc.sig, parent ? [' · in ', jump(parent, parent.qualified)] : null]));
+    card.appendChild(h('pre', { class: 'xp-sig' }, signature(sc).split('\n').map((l, i) => [i ? '\n' : '', Arch.highlight(l)])));
+    const doc = docText(sc);
+    if (doc) card.appendChild(section('Doc comment', h('pre', { class: 'xp-doc' }, doc)));
+    if (sc.cases && sc.cases.length) card.appendChild(section('Cases', h('p', { class: 'xp-cases' }, sc.cases.join(', '))));
+    placesOf(sc).slice().sort((a, b) => (b.trail === current()) - (a.trail === current())).forEach((on) => card.appendChild(trailBlock(on)));
+    card.appendChild(fileBlock(sc.file));
+    card.appendChild(edgeBlock('Calls', model.out[sc.g], 1, 'Calls nothing the matcher could name.'));
+    card.appendChild(edgeBlock('Called by', model.into[sc.g], 0, 'Nothing calls it by name.'));
+    card.appendChild(h('p', { class: 'xp-hint xp-honest' }, 'Read when the site was written, not by a compiler. The Granite flows come first: an event sent to a reducer, a relay to another service or a call on its own, an @Agent run, the frames the engine reduces, the reply to a ticket, a handler the root installed; then a call through a protocol to each conformer. A call on a receiver whose type the declarations name is exact. The rest are matched by name and argument labels. Exact: one declaration in the project fits, and its type is named or implied. Likely: the name and labels are unique, and the receiver’s type was not read; a `.case(…)` with no type is matched only when one enum has that case. Ambiguous: more than one fits, and every one is listed.'));
+  }
+  const section = (title, body) => h('section', null, [h('h3', null, title), body]);
+  function citeLine(cite) {
+    if (!cite) return 'Why: the note says what the code does.';
+    return { PIN: 'From a PIN in the code.', doc: 'From the doc comment.', comment: 'From a comment in the code.', WHAT: 'From the file’s WHAT.',
+             code: 'From the declaration itself: it has no doc comment.', trail: 'From the trail the call declared.' }[cite] || cite;
+  }
+  function trailBlock(on) {
+    const t = on.trail, st = t.steps[on.step - 1], entry = st.entries[on.pos];
+    const wrap = h('section', { class: 'xp-on-trail', 'data-trail': t.id }, [
+      h('h3', null, 'On ' + placeName(t)),
+      h('p', { class: 'xp-step-line' }, 'Step ' + st.n + ' of ' + t.steps.length + ' · ' + st.title + ' · function ' + (on.pos + 1) + ' of ' + st.entries.length),
+      entry.hop ? h('p', { class: 'xp-hop', 'data-via': entry.hop[0] }, hopLine(t, entry.hop)) : h('p', { class: 'xp-hop', 'data-via': 'start' }, 'Where this trail starts.'),
+      h('p', { class: 'xp-note' }, Arch.h('span', null, inlineCode(entry.note))),
+      h('p', { class: 'xp-links' }, citeLine(entry.cite)),
+    ]);
+    if (entry.line && entry.line !== model.scopes[entry.scope].sig) {
+      const at = h('button', { type: 'button', class: 'xp-link' }, 'the line the note is about, ' + model.scopes[entry.scope].file.name + ':' + entry.line);
+      at.addEventListener('click', () => flash(entry.line));
+      wrap.appendChild(h('p', { class: 'xp-links' }, ['Anchor: ', at]));
+    }
+    const prev = h('button', { type: 'button', class: 'button' }, '← previous on this trail'), next = h('button', { type: 'button', class: 'button' }, 'next on this trail →');
+    prev.disabled = st.n === 1 && on.pos === 0;
+    next.disabled = st.n === t.steps.length && on.pos === st.entries.length - 1;
+    const from = (d) => { setTrail(t.id); Object.assign(state, { step: st.n, pos: on.pos }); stepBy(d); };
+    prev.addEventListener('click', () => from(-1));
+    next.addEventListener('click', () => from(1));
+    wrap.appendChild(h('p', { class: 'xp-walks' }, [prev, next]));
+    return wrap;
+  }
+  /** How a trail entry is reached, in words, with the entry that reaches it as a button that walks back to it. */
+  function hopLine(t, hop) {
+    const words = HOP[hop[0]] || ['Reached by ' + hop[0], ''];
+    const flow = FLOW_WORD[hop[0]] ? h('span', { class: 'tier tier-flow' }, FLOW_WORD[hop[0]]) : null;
+    if (hop.length < 3) return [flow, flow ? ' ' : '', words[0] + words[1] + '.'];
+    const st = t.steps[hop[1] - 1], from = st && st.entries[hop[2]];
+    if (!from) return [flow, words[0] + words[1] + '.'];
+    const sc = model.scopes[from.scope];
+    const b = h('button', { type: 'button', class: 'xp-link', 'data-fn': sc.id, title: 'Walk back to it: step ' + hop[1] }, sc.label);
+    b.addEventListener('click', () => walkTo(t.id, hop[1], hop[2], { from: 'trail' }));
+    return [flow, flow ? ' ' : '', words[0], b, words[1] + '.'];
+  }
+  /** The hop as the orb reads it. */
+  function hopText(t, hop) {
+    if (!hop) return 'It is where the trail starts.';
+    const words = HOP[hop[0]] || ['Reached by ' + hop[0], ''];
+    const from = hop.length > 2 && t.steps[hop[1] - 1] && t.steps[hop[1] - 1].entries[hop[2]];
+    return (from ? words[0] + model.scopes[from.scope].label + words[1] : words[0] + words[1]) + '.';
+  }
+  /** Backticks in a note become code; nothing else is markup. */
+  const inlineCode = (text) => String(text).split(/(`[^`]+`)/).map((p) => (/^`[^`]+`$/.test(p) ? h('code', null, p.slice(1, -1)) : p));
+  function fileBlock(file) {
+    const wrap = h('section', null, h('h3', null, 'The file'));
+    const folder = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '.';
+    wrap.appendChild(h('p', { class: 'xp-links' }, [h('a', { href: Arch.href.folder(folder), title: 'Its folder’s page' }, file.path),
+      ' · ' + Arch.fmt.n(file.lineCount) + ' lines · ' + file.lang]));
+    const parts = [['WHAT', file.header && file.header.what], ['IN', file.header && file.header.in], ['OUT', file.header && file.header.out], ['PIN', file.header && file.header.pin]].filter((x) => x[1]);
+    if (parts.length) {
+      const d = h('details', { class: 'xp-header' }, h('summary', null, 'Its header: ' + parts.map((x) => x[0]).join(', ')));
+      parts.forEach((x) => { d.appendChild(h('h4', null, x[0])); d.appendChild(h('pre', { class: 'xp-doc' }, headerText(file, x[1]))); });
+      wrap.appendChild(d);
+    } else if (file.summary) wrap.appendChild(h('p', { class: 'xp-doc' }, file.summary));
+    return wrap;
+  }
+  function jump(sc, text, line) {
+    const b = h('button', { type: 'button', class: 'xp-link', 'data-fn': sc.id, title: sc.id }, text);
+    b.addEventListener('click', () => select(sc, { from: 'card', line }));
+    return b;
+  }
+  function edgeBlock(title, edges, end, empty) {
+    const wrap = h('section', { class: 'xp-edges' }, h('h3', null, [title, edges.length ? h('small', null, ' ' + edges.length) : null]));
+    if (!edges.length) { wrap.appendChild(h('p', { class: 'xp-empty' }, empty)); return wrap; }
+    const groups = Object.keys(FLOW_WORD).map((via) => ({ label: FLOW_WORD[via], cls: 'tier-flow', list: edges.filter((e) => e[5] === via) }))
+      .concat([0, 1, 2].map((tier) => ({ label: TIERS[tier], cls: 'tier-' + TIERS[tier], list: edges.filter((e) => !e[5] && e[2] === tier) })));
+    groups.forEach((group) => {
+      const list = group.list.slice().sort((a, b) => a[end] - b[end]);
+      if (!list.length) return;
+      const ul = h('ul');
+      list.forEach((e, k) => {
+        const other = model.scopes[e[end]], caller = model.scopes[e[0]];
+        const at = h('button', { type: 'button', class: 'xp-at', title: 'The call, in ' + caller.file.name }, caller.file.name + ':' + e[3]);
+        at.addEventListener('click', () => { if (state.sc !== caller) select(caller, { from: 'card', scroll: false }); flash(e[3]); });
+        ul.appendChild(h('li', { hidden: k >= 40 ? true : null }, [jump(other, other.label), e[4] > 1 ? h('small', null, ' ×' + e[4]) : null, ' ', at]));
+      });
+      const box = h('div', { class: 'xp-tier' }, [h('span', { class: 'tier ' + group.cls }, group.label), ul]);
+      if (list.length > 40) {
+        const more = h('button', { type: 'button', class: 'xp-link' }, 'and ' + (list.length - 40) + ' more');
+        more.addEventListener('click', () => { Array.from(ul.children).forEach((li) => { li.hidden = false; }); more.remove(); });
+        box.appendChild(more);
+      }
+      wrap.appendChild(box);
+    });
+    return wrap;
+  }
+
+  /** The address of where the reader stands: a step of a trail, a declaration, a file. */
+  function hashFor() {
+    if (state.sc && state.pos >= 0 && state.step && current()) return Arch.href.trail(state.trail, state.step, state.pos + 1);
+    if (state.sc) return Arch.href.file(state.sc.file.path, state.sc.tail);
+    return state.file ? Arch.href.file(state.file.path) : Arch.href.explorer();
+  }
+  function writeHash() {
+    if (!Arch.isExplorerRoute(Arch.route)) return;
+    try { history.replaceState(null, '', hashFor()); Arch.route = Arch.parseRoute(location.hash); } catch (e) { /* file:// may refuse; the view still works */ }
+  }
+
+  function onKey(e) {
+    if (e.target === ui.find || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === ']' || e.key === '[') { stepBy(e.key === ']' ? 1 : -1); e.preventDefault(); }
+    else if (ui.pre.contains(e.target) && (e.key === 'ArrowDown' || e.key === 'ArrowUp') && state.file) {
+      const list = state.file.scopes, at = state.sc ? list.indexOf(state.sc) : -1;
+      const k = Math.max(0, Math.min(list.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
+      if (list[k] && list[k] !== state.sc) select(list[k], { from: 'source' });
+      e.preventDefault();
+    }
+  }
+
+  // MARK: - Self-check
+
+  function selfCheck() {
+    const src = sources(), results = [];
+    const check = (name, ok, detail) => results.push({ name, ok: !!ok, detail: detail || '' });
+    if (!src || !src.index) return [{ name: 'the sources are loaded', ok: false, detail: 'explorer/index.js is missing' }];
+    const m = build(), idx = m.index;
+    let bad;
+    check('every unit’s sources are loaded', !m.missing.length, m.missing.join(', '));
+    bad = idx.files.filter((f, i) => { const file = m.files[i]; return !file || file.path !== f.path || file.scopes.length !== f.scopes || file.first !== f.first || linesOf(file).length !== f.lines; });
+    check('the index and the unit files agree, file by file', !bad.length && idx.files.length === m.files.length, bad.length ? bad[0].path : m.files.length + ' files');
+    bad = m.scopes.filter((sc) => !sc || sc.decl < 1 || sc.decl > sc.sig || lastLine(sc) < sc.sig || lastLine(sc) > linesOf(sc.file).length);
+    check('every declaration’s lines lie inside its file', !bad.length, bad.length ? bad[0].id : Arch.fmt.n(m.scopes.length) + ' declarations');
+    const word = { f: /\bfunc\b/, i: /\binit\b/, d: /\bdeinit\b/, s: /\bsubscript\b/, v: /\bvar\b/, S: /\bstruct\b/, C: /\bclass\b/, E: /\benum\b/, A: /\bactor\b/, X: /\bextension\b/, P: /\bprotocol\b/ };
+    bad = m.scopes.filter((sc) => !word[sc.kind].test(linesOf(sc.file)[sc.sig - 1] || ''));
+    check('every declaration’s signature line holds its keyword', !bad.length, bad.length ? bad[0].id : '');
+    bad = idx.sample.filter((s) => !m.scopes[s[0]] || m.scopes[s[0]].id !== s[1]);
+    check('ids derived here equal the build’s', !bad.length, bad.length ? bad[0][1] + ' is ' + (m.scopes[bad[0][0]] || {}).id : idx.sample.length + ' sampled');
+    bad = idx.edges.filter((e) => !m.scopes[e[0]] || !m.scopes[e[1]] || !(e[2] >= 0 && e[2] <= 2) || (e.length > 5 && idx.flows.indexOf(e[5]) < 0));
+    check('every call edge joins two declarations, with a tier, and every flow has a kind', !bad.length, Arch.fmt.n(idx.edges.length) + ' edges, ' + Arch.fmt.n(idx.edges.filter((e) => e[5]).length) + ' of them flows');
+    const services = (idx.services || []).concat(idx.components || []);
+    bad = services.filter((s) => !m.scopes[s.g] || s.events.some((e) => e[2].some((g) => !m.scopes[g])));
+    check('every service and component, and every reducer they name, is a declaration here', !bad.length,
+          services.length + ' hosts, ' + services.reduce((a, s) => a + s.events.filter((e) => e[2].length).length, 0) + ' of ' + services.reduce((a, s) => a + s.events.length, 0) + ' events with a reducer found');
+    bad = [];
+    m.trails.forEach((t) => t.steps.forEach((st, i) => st.entries.forEach((en, k) => {
+      const sc = m.scopes[en.scope];
+      if (!sc || sc.id !== en.id) bad.push(t.id + ' ' + en.id);
+      if (!(i === 0 && k === 0) && en.hop && !HOP[en.hop[0]]) bad.push(t.id + ' ' + en.id + ' by ' + en.hop[0]);
+    })));
+    check('every trail entry resolves, and every hop has a kind', !bad.length && m.trails.every((t) => t.steps.every((st, i) => st.n === i + 1 && st.entries.length)),
+          bad.length ? bad.slice(0, 3).join(', ') : m.trails.length + ' trails, ' + m.trails.reduce((a, t) => a + t.steps.length, 0) + ' steps');
+    const first = m.scopes.find((sc) => sc && sc.callable && sc.end && sc.end > sc.sig + 1);
+    if (first) {
+      const top = (q) => { const r = search(q)[0]; return r && r.sc; };
+      check('a function is found by name and by its signature', top(first.qualified + first.labelText) === first || top(signature(first).split('\n').join(' ')) === first, first.label);
+    }
+    const reads = first ? [runTool('read_declaration', { name: first.id }), runTool('read_file', { path: first.file.name }), runTool('search_text', { text: first.name })] : [];
+    check('the ask orb’s tools read a declaration, a file and a search', !first || (reads[0].text.length > 40 && /Declarations/.test(reads[1].text) && reads[2].text.indexOf(first.name) >= 0),
+          reads.map((r) => r.text.length).join(', ') + ' characters');
+    const mapped = codeMap().split('\n').filter((l) => /^ {2}\S.*: /.test(l)).length;
+    check('the codebase map gives every file a line', mapped >= m.files.length, Math.round(codeMap().length / 1000) + ' thousand characters');
+    if (Arch.ask && Arch.ask.selfCheck) Arch.ask.selfCheck().forEach((r) => results.push(r));
+    return results;
+  }
+
+  // MARK: - What the ask orb reads
+
+  /** One declaration as the orb's model reads it: where it sits, its trail notes, its file's header, its code with the
+   *  editor's line numbers, and what it calls and what calls it. */
+  function describe(sc, lead, cap) {
+    const m = build(), file = sc.file, lines = linesOf(file);
+    const from = sc.doc ? sc.doc[0] : sc.decl, to = lastLine(sc), last = Math.min(to, from + cap - 1), parts = [];
+    const parent = sc.parent >= 0 ? file.scopes[sc.parent] : null;
+    parts.push(lead + sc.label + ': ' + kindWords(sc) + ' in ' + file.path + ', line ' + sc.sig + (parent ? ', inside ' + parent.qualified : '') + '.');
+    (m.onTrail[sc.g] || []).forEach((on) => {
+      const t = on.trail, st = t.steps[on.step - 1], en = st.entries[on.pos];
+      parts.push('It is on ' + placeName(t) + ', ' + t.subtitle + ': step ' + st.n + ' of ' + t.steps.length + ', "' + st.title + '", function ' + (on.pos + 1) +
+                 ' of ' + st.entries.length + '. ' + hopText(t, en.hop) + ' The trail\'s note on it: ' + en.note);
+    });
+    const what = headerText(file, file.header && file.header.what), pin = headerText(file, file.header && file.header.pin);
+    if (what) parts.push('The file\'s header, WHAT: ' + what.replace(/\s+/g, ' ').trim());
+    else if (file.summary) parts.push('What the file is, from its first doc comment: ' + file.summary);
+    if (pin) parts.push('The file\'s header, PIN: ' + pin.replace(/\s+/g, ' ').trim());
+    const code = [];
+    for (let n = from; n <= last; n++) code.push(n + '  ' + lines[n - 1]);
+    parts.push('Its code, ' + file.name + ' lines ' + from + ' to ' + last + (last < to ? ' of ' + to + ', cut there' : '') + ', each line numbered as in the editor:\n```\n' + code.join('\n') + '\n```');
+    const names = (edges, end) => edges.slice(0, 30).map((e) => m.scopes[e[end]].label + ' (' + (e[5] ? 'Granite ' + FLOW_WORD[e[5]] : TIERS[e[2]]) + ', the call at ' + m.scopes[e[0]].file.name + ':' + e[3] + ')').join('; ') +
+                                   (edges.length > 30 ? '; and ' + (edges.length - 30) + ' more' : '');
+    parts.push('What it calls, matched by name and argument labels when the site was written, not by a compiler: ' + (m.out[sc.g].length ? names(m.out[sc.g], 1) : 'nothing the matcher could name') + '.');
+    parts.push('What calls it, matched the same way: ' + (m.into[sc.g].length ? names(m.into[sc.g], 0) : 'nothing by name') + '.');
+    return parts.join('\n\n');
+  }
+
+  /** The selection, when the reader is on the Explorer: the declaration, or the file alone when none is picked. */
+  function context() {
+    if (!ui || !Arch.isExplorerRoute(Arch.route)) return null;
+    if (state.sc) {
+      const on = onCurrent(state.sc) || placesOf(state.sc)[0];
+      return { kind: 'code', label: state.sc.label + (on ? ' · ' + placeName(on.trail) + ' step ' + on.step : ''), text: describe(state.sc, 'The reader is on the Explorer, looking at ', 220) };
+    }
+    if (state.file) return { kind: 'code', label: state.file.name, text: 'The reader is on the Explorer, looking at the file ' + state.file.path + ' with no declaration picked.\n\n' + outlineOf(state.file) };
+    return null;
+  }
+
+  /** A file as read_file reads it with no lines asked for: what it is, then its declarations with their lines. */
+  function outlineOf(file) {
+    const lines = linesOf(file), cap = 240;
+    const head = [headerText(file, file.header && file.header.what) || file.summary, headerText(file, file.header && file.header.pin)].filter(Boolean).map((x) => x.replace(/\s+/g, ' ').trim());
+    const outline = file.scopes.slice(0, cap).map((sc) => '  line ' + sc.sig + ': ' + '  '.repeat(sc.depth) + KIND[sc.kind] + ' ' + sc.name + sc.labelText);
+    return file.path + ', ' + lines.length + ' lines of ' + file.lang + '.\nWhat it is: ' + (head.join(' PIN: ') || 'not said') +
+           '\nDeclarations' + (file.scopes.length > cap ? ', the first ' + cap + ' of ' + file.scopes.length : '') + ':\n' + (outline.join('\n') || '  none read');
+  }
+
+  /** The codebase at a glance, for the orb: the trails, the services by rank, then every file with the first sentence
+   *  of what it is, folder by folder, or what it declares when nothing says. Sent again with every round of a question:
+   *  the price of a model that picks files by what they are rather than by their names. */
+  let mapText = null;
+  function codeMap() {
+    if (mapText) return mapText;
+    const m = build(), lines = [], onTrails = new Set(), byFolder = new Map();
+    m.trails.forEach((t) => t.steps.forEach((st) => st.entries.forEach((en) => onTrails.add(m.scopes[en.scope].file.path))));
+    m.files.forEach((f) => {
+      const dir = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '.';
+      if (!byFolder.has(dir)) byFolder.set(dir, []);
+      byFolder.get(dir).push(f);
+    });
+    if (m.trails.length) {
+      lines.push('The trails, walks through the code in the order it runs:');
+      m.trails.forEach((t) => {
+        lines.push(t.title + ', ' + t.subtitle + ':');
+        t.steps.forEach((st) => lines.push('  ' + st.n + '. ' + st.title + ': ' + st.entries.map((en) => m.scopes[en.scope].qualified).join(', ')));
+      });
+      lines.push('');
+    }
+    const services = m.index.services || [], components = m.index.components || [];
+    if (services.length) {
+      lines.push('The Granite services, lowest rank first; a service reaches only lower ranks. Each: its module, rank, the services it reaches, its events and the reducer each names:');
+      services.forEach((sv) => lines.push('  ' + sv.name + ', ' + sv.module + ', rank ' + sv.rank + (sv.relays.length ? ', reaches ' + sv.relays.join(', ') : '') +
+        ': ' + (sv.events.map((e) => e[0] + ' → ' + e[1]).join(', ') || 'no events') + (sv.agents.length ? '; agents ' + sv.agents.map((a) => a[0] + ': ' + a[1] + ' ' + a[2]).join(', ') : '')));
+      lines.push('');
+    }
+    if (components.length) {
+      lines.push('The Granite components, each with the services it reads and its own events:');
+      components.forEach((c) => lines.push('  ' + c.name + ', ' + c.module + (c.relays.length ? ', reads ' + c.relays.join(', ') : '') + ': ' + (c.events.map((e) => e[0] + ' → ' + e[1]).join(', ') || 'no events')));
+      lines.push('');
+    }
+    lines.push(m.files.length + ' files of code, folder by folder, each with the first sentence of what it is, or what it declares when nothing says. A file on a trail ends with "· on a trail":');
+    byFolder.forEach((list, dir) => {
+      lines.push(dir + '/');
+      list.forEach((f) => {
+        const declared = f.scopes.filter((sc) => sc.parent < 0).slice(0, 3).map((sc) => KIND[sc.kind] + ' ' + sc.name).join(', ');
+        const what = f.summary || (declared ? 'declares ' + declared : f.lang + ' with no declarations read');
+        lines.push('  ' + f.name + ': ' + (what.length > 160 ? what.slice(0, 157) + '…' : what) + (onTrails.has(f.path) ? ' · on a trail' : ''));
+      });
+    });
+    mapText = lines.join('\n');
+    return mapText;
+  }
+
+  // MARK: - The orb's tools: the whole codebase, read on demand from the data this page holds
+
+  const TOOL_SPECS = [
+    { type: 'function', function: { name: 'find_declarations', description: 'Find declarations in the project by name, Type.method, or part of a name. Returns up to 30, each with its file, line and id.',
+      parameters: { type: 'object', properties: { query: { type: 'string', description: 'A name such as save, RecipeStore.save or RecipeStore.save(_:)' } }, required: ['query'] } } },
+    { type: 'function', function: { name: 'read_declaration', description: 'Read one declaration whole: its code with line numbers, its doc comment, its file\'s header, its trail notes, and what it calls and what calls it.',
+      parameters: { type: 'object', properties: { name: { type: 'string', description: 'Its qualified name, with argument labels when several share it, or an id from find_declarations' } }, required: ['name'] } } },
+    { type: 'function', function: { name: 'search_text', description: 'Search every file of code for a piece of text, ignoring case. Returns up to 80 matching lines grouped by file, each with its line number; when more match, it says how many more, so narrow the text.',
+      parameters: { type: 'object', properties: { text: { type: 'string', description: 'The text to look for' } }, required: ['text'] } } },
+    { type: 'function', function: { name: 'read_file', description: 'Read a file of code. Without lines, returns what it is and the outline of its declarations, up to 240; with from and to, returns those lines, numbered, at most 300.',
+      parameters: { type: 'object', properties: { path: { type: 'string', description: 'Its path from the project\'s root, a path from any folder, or its file name as the map lists it' }, from: { type: 'integer' }, to: { type: 'integer' } }, required: ['path'] } } },
+  ];
+  function resolveDeclaration(q) {
+    const m = build();
+    q = String(q || '').trim().replace(/^`+|`+$/g, '');
+    if (!q) return [];
+    const byId = m.scopes.filter((sc) => sc.id === q);
+    if (byId.length) return byId;
+    let hits = findSymbol(q);
+    if (!hits.length && /\(/.test(q)) hits = findSymbol(q.replace(/\(.*$/, ''));
+    return hits;
+  }
+  /** A file by its path from the root, a path from any folder, or its name, with or without its extension and a :line. */
+  function fileNamed(p) {
+    const m = build();
+    p = String(p || '').trim().replace(/^`+|`+$/g, '').replace(/^\/+/, '').replace(/:\d+(?:[-–]\d+)?$/, '');
+    if (m.byPath[p]) return [m.byPath[p]];
+    const named = m.files.filter((f) => f.path === p || f.path.endsWith('/' + p) || f.name === p);
+    if (named.length) return named;
+    return m.files.filter((f) => f.path.replace(/\.[^./]+$/, '') === p || f.path.replace(/\.[^./]+$/, '').endsWith('/' + p) || f.name.replace(/\.[^.]+$/, '') === p);
+  }
+  const TOOLS = {
+    find_declarations(a) {
+      const q = String(a.query || '').trim(), m = build();
+      if (!q) return { text: 'Give a name to find.' };
+      const found = search(q).filter((r) => r.sc).slice(0, 30);
+      if (!found.length) return { text: 'Nothing in the code is named like "' + q + '". Try search_text for words inside the code.', read: { label: 'looked for ' + q } };
+      return { read: { label: 'looked for ' + q }, text: found.map((r) => {
+        const sc = r.sc, places = m.onTrail[sc.g] || [];
+        return sc.label + ': ' + KIND[sc.kind] + ', ' + sc.file.path + ':' + sc.sig + places.map((o) => ', ' + placeName(o.trail) + ' step ' + o.step).join('') + '. id ' + sc.id;
+      }).join('\n') };
+    },
+    read_declaration(a) {
+      const hits = resolveDeclaration(a.name);
+      if (!hits.length) return { text: 'No declaration matches "' + a.name + '". Use find_declarations first.' };
+      if (hits.length > 1) return { text: 'Several declarations match; read one by its id:\n' + hits.slice(0, 12).map((sc) => sc.id + ' (' + KIND[sc.kind] + ', ' + sc.file.path + ':' + sc.sig + ')').join('\n') };
+      const sc = hits[0];
+      return { read: { label: sc.qualified + sc.labelText, href: Arch.href.file(sc.file.path, sc.tail) }, text: describe(sc, '', 260) };
+    },
+    search_text(a) {
+      const needle = String(a.text || '').trim(), low = needle.toLowerCase(), groups = [], cap = 80;
+      let total = 0, shown = 0, files = 0;
+      if (low.length < 2) return { text: 'Give at least two characters to search for.' };
+      build().files.forEach((f) => {
+        const lines = linesOf(f), mine = [];
+        lines.forEach((l, i) => { if (l.toLowerCase().indexOf(low) >= 0) mine.push(i + 1); });
+        if (!mine.length) return;
+        files++;
+        total += mine.length;
+        if (shown >= cap) return;
+        const take = mine.slice(0, cap - shown);
+        shown += take.length;
+        groups.push(f.path + ' · ' + mine.length + (mine.length === 1 ? ' line' : ' lines') + (take.length < mine.length ? ', the first ' + take.length : '') + ':\n' +
+                    take.map((n) => '  ' + n + ': ' + lines[n - 1].trim().slice(0, 160)).join('\n'));
+      });
+      if (!total) return { read: { label: 'searched "' + needle + '"' }, text: 'No line of the code contains "' + needle + '".' };
+      const tail = total > shown ? '\nand ' + (total - shown) + ' more lines, ' + total + ' in ' + files + ' files in all; narrow the text to see the rest' : '';
+      return { read: { label: 'searched "' + needle + '"' }, text: groups.join('\n') + tail };
+    },
+    read_file(a) {
+      const files = fileNamed(a.path);
+      if (files.length > 1) return { text: 'Several files match: ' + files.slice(0, 20).map((f) => f.path).join(', ') };
+      if (!files.length) return { text: 'No file ' + a.path + ' in the project.' };
+      const file = files[0], lines = linesOf(file);
+      const cited = /:(\d+)(?:[-–](\d+))?$/.exec(String(a.path || '').trim());
+      if (cited && !a.from) { a = Object.assign({}, a, { from: +cited[1], to: cited[2] ? +cited[2] : undefined }); }
+      if (!a.from && !a.to) return { read: { label: file.name, href: Arch.href.file(file.path) }, text: outlineOf(file) };
+      const from = Math.max(1, Math.floor(+a.from || 1));
+      let to = Math.min(lines.length, Math.floor(+a.to || from + 119));
+      if (to < from) to = Math.min(lines.length, from + 119);
+      if (to - from > 299) to = from + 299;
+      const body = [];
+      for (let n = from; n <= to; n++) body.push(n + '  ' + lines[n - 1]);
+      return { read: { label: file.name + ' ' + from + '–' + to, href: Arch.href.file(file.path, from) }, text: file.path + ' lines ' + from + ' to ' + to + ' of ' + lines.length + ':\n```\n' + body.join('\n') + '\n```' };
+    },
+  };
+  /** Runs one tool call from the orb: its name and its JSON arguments in, { text, read } out, the text capped. */
+  function runTool(name, args) {
+    if (!build()) return { text: 'The sources are not loaded on this page.' };
+    try { args = typeof args === 'string' ? JSON.parse(args || '{}') : (args || {}); } catch (e) { return { text: 'The arguments were not JSON: ' + String(args).slice(0, 100) }; }
+    const fn = TOOLS[name];
+    if (!fn) return { text: 'There is no tool named ' + name + '.' };
+    const result = fn(args);
+    if (result.text.length > 14000) result.text = result.text.slice(0, 14000) + '\n[cut here]';
+    return result;
+  }
+
+  // MARK: - The view, registered
+
+  const explorerView = {
+    title: 'Explorer',
+    render() {
+      return { main: html`<div class="xp-host" id="xp-host"><p class="view-lede">Loading the sources…</p></div>`, inspector: html`<div id="xp-card-host"></div>` };
+    },
+    after(route, main, inspector) {
+      const host = main.querySelector('#xp-host'), cardHost = inspector.querySelector('#xp-card-host');
+      if (ui) { attach(host, cardHost); go(targetOf(route)); return; }
+      load().then((ok) => {
+        // The reader may have moved on while it loaded; the view mounts when they come back.
+        if (!Arch.isExplorerRoute(Arch.route)) return;
+        const hostNow = document.getElementById('xp-host'), cardNow = document.getElementById('xp-card-host');
+        if (!ok || !build()) {
+          hostNow.innerHTML = String(html`<h1 class="view-title">The Explorer’s data is not here</h1><p class="view-lede">It reads <code>explorer/*.js</code> beside this page. To write them, ${REBUILD}.</p>`);
+          return;
+        }
+        mount();
+        attach(hostNow, cardNow);
+        go(targetOf(Arch.route), true);
+        window.dispatchEvent(new CustomEvent('docs:explorer'));
+      });
+    },
+  };
+  Arch.views.explorer = explorerView;
+
+  Arch.explorer = {
+    load, ensure, model: build, search, parseTarget, selfCheck, context, map: codeMap, tools: TOOL_SPECS, tool: runTool,
+    /** Where the reader is, for the headless checks. */
+    place: () => (ui ? { file: state.file && state.file.path, scope: state.sc && state.sc.id, trail: state.trail, step: state.step, pos: state.pos, hash: hashFor() } : null),
+  };
+})();

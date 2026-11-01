@@ -1,0 +1,9 @@
+{
+  "name": "Docs",
+  "tagline": "Documentation of any codebase from its code: a README, Markdown docs, or a static site with a code explorer.",
+  "category": "developer",
+  "keywords": ["documentation", "readme", "markdown", "static site", "code explorer", "call graph", "granite", "swift"],
+  "platforms": ["macOS 14"],
+  "license": "MIT",
+  "description": "Documentation of any codebase, written from its code. Say `{\"make\": \"readme\"}`, `{\"make\": \"markdown\"}` or `{\"make\": \"site\"}`: Docs reads the project's manifests and every file, walks its Swift with a lexer and a brace walk, matches its calls and its Granite flows, and writes what the code says of itself.\n\nThe README says what the project is, its features, how to build and test it (read off its Xcode schemes, Swift packages and scripts), its folder tree and how it is built. The Markdown docs give the modules in dependency order, a page per folder, a glossary and how to build. The site, which opens from `file://` with no server, has a page per folder, every file with its declarations, an Explorer with the call graph and the Granite services by rank, trails through the code, search, every Markdown file, and an optional ask orb whose key only the person ever writes.\n\nThe model writes only prose, each claim citing a file it was shown; without a model the prose is left out and said so, never filled with placeholder text.\n\nOne of the Rao Craft Agents: independent packages that, tagged in prompts along the life of a project, build an app of Loom's quality."
+}
