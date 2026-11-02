@@ -1,0 +1,19 @@
+{
+  "name": "Docs",
+  "tagline": "Documentation of any codebase from its code: a README, Markdown docs, or a static site with a code explorer.",
+  "category": "developer",
+  "keywords": [
+    "documentation",
+    "readme",
+    "markdown",
+    "static site",
+    "code explorer",
+    "call graph",
+    "granite",
+    "swift"
+  ],
+  "platforms": [
+    "macOS 14"
+  ],
+  "license": "MIT"
+}
