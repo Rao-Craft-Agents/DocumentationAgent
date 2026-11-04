@@ -1,7 +1,8 @@
 import Foundation
+import GraniteAgents
 
 /// What a call answers: the files written, as absolute paths, and a few counts and sentences a model can relay.
-public struct DocumentationResult: Codable, Sendable, Equatable {
+public struct DocumentationResult: AgentAnswer, Equatable {
     /// The file to open first: the README, `Architecture.md`, or the site's `index.html`.
     public var path: String?
     /// Every file written.
